@@ -12,6 +12,7 @@ dev = BLE_MIDI_DEVICE.instance
 dev.connected?                            # linked and subscribed
 MIDI::Device.new(dev).note_on(60, 100)
 BLE_MIDI_DEVICE.info                      # state, peer, MTU, interval, counters
+BLE_MIDI_DEVICE.rx_latency = 20           # ms (:auto by default, 0 = off)
 ```
 
 - ESP32 only, on NimBLE through picoruby-ble's ESP32 port (its shared NimBLE
@@ -20,6 +21,11 @@ BLE_MIDI_DEVICE.info                      # state, peer, MTU, interval, counters
 - BLE-MIDI framing: picoruby-midi's `ble_midi_codec.h`.
 - Build-time knobs (name, connection interval, queues, task):
   `include/ble_midi_device_config.h`.
+- Incoming messages keep the spacing of the central's timestamps
+  (`rx_latency`; a constant delay instead of the connection interval's
+  jitter). picoruby-midi's `ble_midi_sync_*` and `midi_timed_ring.h`.
+- Works alongside picoruby-ble's `BLE` class: while its peripheral
+  advertises, ours pauses (one advertising set at a time).
 - The link is process-wide C state: it survives script changes.
 
 Design and details: Midori's docs/BLE_MIDI.md.

@@ -32,6 +32,7 @@
 
 #include "nimble_owner.h"       /* picoruby-ble's ESP32 port */
 #include "ble_midi_codec.h"     /* picoruby-midi */
+#include "midi_timed_ring.h"
 #include "midi.h"
 #include "midi_route.h"
 
@@ -43,8 +44,8 @@ static const char *TAG = "BLE_MIDI_DEV";
 #define NB_ENABLE      0x02
 #define NB_DISABLE     0x04
 #define NB_DISCONNECT  0x08
+#define NB_ADV         0x10    /* advertising free again (the BLE class let go) */
 
-#define RX_MASK (BLE_MIDI_DEVICE_RX_PACKETS - 1)
 #define TX_MASK (BLE_MIDI_DEVICE_TX_PACKETS - 1)
 
 /* Largest ATT MTU NimBLE takes is 527; a notification carries MTU - 3 */
@@ -73,9 +74,12 @@ static TaskHandle_t s_task;
 static esp_timer_handle_t s_batch_timer;
 
 /* RX: single producer (host task), single consumer (input task or Ruby) */
-static uint8_t (*s_rx)[4];
-static volatile uint32_t s_rx_head, s_rx_tail;
+static midi_timed_ring_t *s_rx;
 static ble_midi_decoder_t s_dec;
+static ble_midi_sync_t s_sync;
+static volatile int32_t s_rx_latency = BLE_MIDI_DEVICE_RX_LATENCY_US;
+static int64_t s_rx_now;            /* arrival of the packet being decoded */
+static int32_t s_rx_budget;         /* its correction */
 
 /* TX: several producers, the gem's task consumes */
 static tx_entry_t *s_tx;
@@ -90,6 +94,7 @@ static bool s_enc_open;             /* s_enc holds a packet being filled */
 static ble_midi_device_stats_t s_stats;
 
 static int gap_event(struct ble_gap_event *event, void *arg);
+static picoruby_nimble_client_t s_client;
 static int chr_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg);
 
 /* 03B80E5A-EDE8-4B33-A751-6CE34EC4C700 / 7772E5DB-3868-4112-A1A9-F2669D106BF3 */
@@ -139,17 +144,21 @@ static void wake(uint32_t bits)
  * RX
  * ------------------------------------------------------------------- */
 
+static int32_t rx_budget(void)
+{
+    int32_t l = s_rx_latency;
+    if (l < 0) return ble_midi_sync_auto_budget(s_stats.interval_1250us);
+    return l;
+}
+
 static void rx_push(void *arg, const uint8_t pkt[4], uint16_t ts)
 {
-    (void)arg; (void)ts;
-    uint32_t head = s_rx_head;
-    uint32_t next = (head + 1) & RX_MASK;
-    if (next == s_rx_tail) {
+    (void)arg;
+    int64_t at = ble_midi_sync_release(&s_sync, ts, s_rx_now, s_rx_budget);
+    if (!midi_timed_ring_push(s_rx, pkt, at)) {
         s_stats.rx_dropped++;
         return;
     }
-    memcpy(s_rx[head], pkt, 4);
-    s_rx_head = next;
     s_stats.rx_messages++;
 }
 
@@ -166,9 +175,12 @@ static int chr_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
         if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &len) != 0) return BLE_ATT_ERR_UNLIKELY;
         if (conn != s_conn) return 0;
         s_stats.rx_packets++;
+        s_rx_now = esp_timer_get_time();
+        s_rx_budget = rx_budget();
         if (ble_midi_decode(&s_dec, buf, len, rx_push, NULL) != 0) {
             s_stats.decode_errors = s_dec.errors;
         }
+        midi_timed_ring_commit(s_rx);
         return 0;
     }
     default:
@@ -179,22 +191,23 @@ static int chr_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
 int BLE_MIDI_DEVICE_bytes_available(void)
 {
     if (s_rx == NULL) return 0;
-    return (int)(((s_rx_head - s_rx_tail) & RX_MASK) * 4);
+    return midi_timed_ring_bytes_due(s_rx);
 }
 
 int BLE_MIDI_DEVICE_read_packet(uint8_t *buf, size_t maxlen)
 {
     if (s_rx == NULL) return 0;
-    size_t n = 0;
-    while (n + 4 <= maxlen) {
-        uint32_t tail = s_rx_tail;
-        if (tail == s_rx_head) break;
-        memcpy(buf + n, s_rx[tail], 4);
-        s_rx_tail = (tail + 1) & RX_MASK;
-        n += 4;
-    }
-    return (int)n;
+    return midi_timed_ring_read(s_rx, buf, maxlen);
 }
+
+void BLE_MIDI_DEVICE_set_rx_latency(int32_t us)
+{
+    if (us < -1) us = -1;
+    if (us > 100000) us = 100000;
+    s_rx_latency = us;
+}
+
+int32_t BLE_MIDI_DEVICE_rx_latency_setting(void) { return s_rx_latency; }
 
 /* ---------------------------------------------------------------------
  * TX
@@ -332,7 +345,16 @@ static void adv_start(void)
 {
     if (!s_wanted || !s_held || s_conn != BLE_HS_CONN_HANDLE_NONE) return;
     if (!picoruby_nimble_synced()) return;
-    if (ble_gap_adv_active()) return;
+    /* one advertising at a time on the shared host; the BLE class (a
+     * script's peripheral) goes first and we wait for proc_free */
+    if (!picoruby_nimble_claim(&s_client, PICORUBY_NIMBLE_PROC_ADV)) {
+        if (s_state == BLE_MIDI_DEVICE_ADVERTISING) {
+            ESP_LOGI(TAG, "advertising paused: the BLE class advertises");
+        }
+        s_state = BLE_MIDI_DEVICE_STARTING;
+        return;
+    }
+    if (ble_gap_adv_active()) return;     /* ours, going */
 
     struct ble_hs_adv_fields f;
     memset(&f, 0, sizeof(f));
@@ -343,6 +365,7 @@ static void adv_start(void)
     int rc = ble_gap_adv_set_fields(&f);
     if (rc != 0) {
         ESP_LOGE(TAG, "advertising data: %d", rc);
+        picoruby_nimble_unclaim(&s_client, PICORUBY_NIMBLE_PROC_ADV);
         s_state = BLE_MIDI_DEVICE_ERROR;
         return;
     }
@@ -366,6 +389,7 @@ static void adv_start(void)
         s_state = BLE_MIDI_DEVICE_ADVERTISING;
     } else {
         ESP_LOGE(TAG, "advertising: %d", rc);
+        picoruby_nimble_unclaim(&s_client, PICORUBY_NIMBLE_PROC_ADV);
         s_state = BLE_MIDI_DEVICE_ERROR;
     }
 }
@@ -388,6 +412,8 @@ static void link_down(void)
     s_mtu = 23;
     tx_clear();
     ble_midi_decoder_reset(&s_dec);
+    ble_midi_sync_reset(&s_sync);
+    if (s_rx) midi_timed_ring_clear(s_rx);
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -395,6 +421,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
+        /* the advertising that made it is over */
+        picoruby_nimble_unclaim(&s_client, PICORUBY_NIMBLE_PROC_ADV);
         if (event->connect.status == 0) {
             uint16_t conn = event->connect.conn_handle;
             link_down();
@@ -443,6 +471,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
+        picoruby_nimble_unclaim(&s_client, PICORUBY_NIMBLE_PROC_ADV);
         adv_start();
         break;
 
@@ -531,12 +560,28 @@ static void client_on_reset(int reason)
     if (s_wanted) s_state = BLE_MIDI_DEVICE_STARTING;
 }
 
+/* The BLE class took the advertising (its peripheral advertises) */
+static void client_yield(int proc)
+{
+    if (proc != PICORUBY_NIMBLE_PROC_ADV) return;
+    ble_gap_adv_stop();
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE && s_wanted) s_state = BLE_MIDI_DEVICE_STARTING;
+}
+
+static void client_proc_free(int proc)
+{
+    if (proc == PICORUBY_NIMBLE_PROC_ADV) wake(NB_ADV);
+}
+
 static picoruby_nimble_client_t s_client = {
     .name = "BLE-MIDI device",
     .setup = client_setup,
     .configure = client_configure,
     .on_sync = client_on_sync,
     .on_reset = client_on_reset,
+    .yield = client_yield,
+    .proc_free = client_proc_free,
+    .provides_gap = true,           /* ble_svc_gap_init / ble_svc_gatt_init */
 };
 
 static void do_enable(void)
@@ -545,7 +590,7 @@ static void do_enable(void)
     s_state = BLE_MIDI_DEVICE_STARTING;
     int rc = picoruby_nimble_acquire(&s_client);
     if (rc != 0) {
-        ESP_LOGE(TAG, "%s", rc == -2 ? "BLE is held by the BLE class" : "BLE host did not start");
+        ESP_LOGE(TAG, "BLE host did not start");
         s_state = BLE_MIDI_DEVICE_ERROR;
         return;
     }
@@ -559,7 +604,10 @@ static void do_disable(void)
     if (s_wanted || !s_held) return;
     uint16_t conn = s_conn;
     if (conn != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
-    if (ble_gap_adv_active()) ble_gap_adv_stop();
+    if (picoruby_nimble_holds(&s_client, PICORUBY_NIMBLE_PROC_ADV)) {
+        ble_gap_adv_stop();
+        picoruby_nimble_unclaim(&s_client, PICORUBY_NIMBLE_PROC_ADV);
+    }
     link_down();
     s_held = false;
     picoruby_nimble_release(&s_client);
@@ -576,6 +624,7 @@ static void device_task(void *arg)
         xTaskNotifyWait(0, UINT32_MAX, &bits, wait);
         if (bits & NB_ENABLE) do_enable();
         if (bits & NB_DISABLE) do_disable();
+        if ((bits & NB_ADV) && s_held) adv_start();
         if (bits & NB_DISCONNECT) {
             uint16_t conn = s_conn;
             if (conn != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
@@ -609,7 +658,7 @@ int BLE_MIDI_DEVICE_init(void)
 {
     if (s_inited) return 0;
     /* Buffers off the .bss (docs/MEMORY_ALLOCATION.md); PSRAM is fine */
-    s_rx = heap_caps_calloc(BLE_MIDI_DEVICE_RX_PACKETS, 4, MALLOC_CAP_8BIT);
+    if (s_rx == NULL) s_rx = midi_timed_ring_new(BLE_MIDI_DEVICE_RX_PACKETS, "ble_midi_dev_rx");
     s_tx = heap_caps_calloc(BLE_MIDI_DEVICE_TX_PACKETS, sizeof(tx_entry_t), MALLOC_CAP_8BIT);
     s_txbuf = heap_caps_malloc(TX_BUF_MAX, MALLOC_CAP_8BIT);
     if (!s_rx || !s_tx || !s_txbuf) {
@@ -644,7 +693,7 @@ int BLE_MIDI_DEVICE_init(void)
     return 0;
 
 fail:
-    heap_caps_free(s_rx); s_rx = NULL;
+    /* (the RX ring is kept: init is not retried after running out) */
     heap_caps_free(s_tx); s_tx = NULL;
     heap_caps_free(s_txbuf); s_txbuf = NULL;
     return -1;
@@ -690,6 +739,8 @@ void BLE_MIDI_DEVICE_stats(ble_midi_device_stats_t *out)
     out->state = s_state;
     out->mtu = s_mtu;
     out->decode_errors = s_dec.errors;
+    out->rx_late = s_sync.late;
+    out->rx_latency_us = rx_budget();
 }
 
 #else  /* !BLE_MIDI_DEVICE_ENABLED */
@@ -712,6 +763,8 @@ int  BLE_MIDI_DEVICE_send_packet(uint8_t cable, uint8_t cin, uint8_t b1, uint8_t
 int  BLE_MIDI_DEVICE_bytes_available(void) { return 0; }
 int  BLE_MIDI_DEVICE_read_packet(uint8_t *buf, size_t maxlen) { (void)buf; (void)maxlen; return 0; }
 void BLE_MIDI_DEVICE_disconnect(void) {}
+void BLE_MIDI_DEVICE_set_rx_latency(int32_t us) { (void)us; }
+int32_t BLE_MIDI_DEVICE_rx_latency_setting(void) { return 0; }
 void BLE_MIDI_DEVICE_stats(ble_midi_device_stats_t *out)
 {
     if (out) memset(out, 0, sizeof(*out));

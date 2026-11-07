@@ -100,6 +100,22 @@ mrb_bmd_disconnect(mrb_state *mrb, mrb_value self)
     return mrb_nil_value();
 }
 
+/* BLE_MIDI_DEVICE._rx_latency => -1 (auto) / 0 (off) / microseconds */
+static mrb_value
+mrb_bmd_rx_latency(mrb_state *mrb, mrb_value self)
+{
+    return mrb_fixnum_value(BLE_MIDI_DEVICE_rx_latency_setting());
+}
+
+static mrb_value
+mrb_bmd_set_rx_latency(mrb_state *mrb, mrb_value self)
+{
+    mrb_int us;
+    mrb_get_args(mrb, "i", &us);
+    BLE_MIDI_DEVICE_set_rx_latency((int32_t)us);
+    return mrb_fixnum_value(BLE_MIDI_DEVICE_rx_latency_setting());
+}
+
 static void
 hset(mrb_state *mrb, mrb_value h, const char *key, mrb_value v)
 {
@@ -132,6 +148,8 @@ mrb_bmd_info(mrb_state *mrb, mrb_value self)
     hset(mrb, h, "rx_messages", mrb_fixnum_value(st.rx_messages));
     hset(mrb, h, "rx_dropped", mrb_fixnum_value(st.rx_dropped));
     hset(mrb, h, "decode_errors", mrb_fixnum_value(st.decode_errors));
+    hset(mrb, h, "rx_late", mrb_fixnum_value(st.rx_late));
+    hset(mrb, h, "rx_latency_ms", mrb_float_value(mrb, st.rx_latency_us / 1000.0));
     hset(mrb, h, "tx_messages", mrb_fixnum_value(st.tx_messages));
     hset(mrb, h, "tx_packets", mrb_fixnum_value(st.tx_packets));
     hset(mrb, h, "tx_dropped", mrb_fixnum_value(st.tx_dropped));
@@ -159,6 +177,8 @@ mrb_picoruby_ble_midi_device_gem_init(mrb_state *mrb)
     mrb_define_class_method_id(mrb, cls, MRB_SYM(_set_name),   mrb_bmd_set_name,   MRB_ARGS_REQ(1));
     mrb_define_class_method_id(mrb, cls, MRB_SYM(_disconnect), mrb_bmd_disconnect, MRB_ARGS_NONE());
     mrb_define_class_method_id(mrb, cls, MRB_SYM(_info),       mrb_bmd_info,       MRB_ARGS_NONE());
+    mrb_define_class_method_id(mrb, cls, MRB_SYM(_rx_latency), mrb_bmd_rx_latency, MRB_ARGS_NONE());
+    mrb_define_class_method_id(mrb, cls, MRB_SYM(_set_rx_latency), mrb_bmd_set_rx_latency, MRB_ARGS_REQ(1));
 }
 
 void

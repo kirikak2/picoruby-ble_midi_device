@@ -20,8 +20,8 @@ class BLE_MIDI_DEVICE
 
   # Advertise (true) or drop the link and stop advertising (false).
   # Turning it on returns at once (the BLE host takes a moment to come up);
-  # turning it off waits until it is off (up to 3 s), so that a script can
-  # use the BLE class right after (it needs the BLE host to itself).
+  # turning it off waits until it is off (up to 3 s). The BLE class works
+  # alongside: while its peripheral advertises, ours pauses.
   # For this script only: the saved setting comes back when it ends.
   def self.enable=(on)
     _enable(on ? true : false)
@@ -63,6 +63,29 @@ class BLE_MIDI_DEVICE
 
   def self.disconnect
     _disconnect
+  end
+
+  # Receive timing correction (docs/BLE_MIDI.md §8): incoming messages keep
+  # the spacing of the central's timestamps, this much later. :auto (the
+  # connection interval plus a margin, the default), 0 / false / :off (as
+  # they arrive), or milliseconds (at most 100). Until the script ends.
+  def self.rx_latency
+    us = _rx_latency
+    us < 0 ? :auto : us / 1000.0
+  end
+
+  def self.rx_latency=(ms)
+    _set_rx_latency(BLE_MIDI_DEVICE._latency_us(ms))
+  end
+
+  def self._latency_us(ms)
+    case ms
+    when :auto, nil, true then -1
+    when :off, false then 0
+    else
+      us = (ms * 1000).to_i
+      us < 0 ? 0 : us
+    end
   end
 
   def initialize

@@ -86,6 +86,19 @@ static void c_bmd_disconnect(mrbc_vm *vm, mrbc_value v[], int argc)
     SET_NIL_RETURN();
 }
 
+static void c_bmd_rx_latency(mrbc_vm *vm, mrbc_value v[], int argc)
+{
+    SET_INT_RETURN(BLE_MIDI_DEVICE_rx_latency_setting());
+}
+
+static void c_bmd_set_rx_latency(mrbc_vm *vm, mrbc_value v[], int argc)
+{
+    if (argc >= 1 && v[1].tt == MRBC_TT_INTEGER) {
+        BLE_MIDI_DEVICE_set_rx_latency((int32_t)v[1].i);
+    }
+    SET_INT_RETURN(BLE_MIDI_DEVICE_rx_latency_setting());
+}
+
 static void hset(mrbc_value *h, const char *key, mrbc_value *val)
 {
     mrbc_value k = mrbc_symbol_value(mrbc_str_to_symid(key));
@@ -120,6 +133,7 @@ static void c_bmd_info(mrbc_vm *vm, mrbc_value v[], int argc)
     hset_int(vm, &h, "rx_messages", st.rx_messages);
     hset_int(vm, &h, "rx_dropped", st.rx_dropped);
     hset_int(vm, &h, "decode_errors", st.decode_errors);
+    hset_int(vm, &h, "rx_late", st.rx_late);
     hset_int(vm, &h, "tx_messages", st.tx_messages);
     hset_int(vm, &h, "tx_packets", st.tx_packets);
     hset_int(vm, &h, "tx_dropped", st.tx_dropped);
@@ -145,4 +159,6 @@ mrbc_ble_midi_device_init(mrbc_vm *vm)
     mrbc_define_method(vm, cls, "_set_name",        c_bmd_set_name);
     mrbc_define_method(vm, cls, "_disconnect",      c_bmd_disconnect);
     mrbc_define_method(vm, cls, "_info",            c_bmd_info);
+    mrbc_define_method(vm, cls, "_rx_latency",      c_bmd_rx_latency);
+    mrbc_define_method(vm, cls, "_set_rx_latency",  c_bmd_set_rx_latency);
 }

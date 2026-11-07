@@ -49,6 +49,14 @@
 #define BLE_MIDI_DEVICE_TX_PACKETS 256      /* power of 2 */
 #endif
 
+/* Receive timing correction (docs/BLE_MIDI.md §8): incoming messages are
+ * passed on with the spacing of the central's timestamps, this much later
+ * than the fastest arrival (microseconds). -1: the connection interval plus
+ * a margin (ble_midi_sync_auto_budget); 0: off, as they arrive. */
+#ifndef BLE_MIDI_DEVICE_RX_LATENCY_US
+#define BLE_MIDI_DEVICE_RX_LATENCY_US (-1)
+#endif
+
 /* Wait after the first queued packet before sending, so that a chord goes
  * in one notification (microseconds) */
 #ifndef BLE_MIDI_DEVICE_TX_BATCH_US

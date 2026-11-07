@@ -13,7 +13,9 @@
  * does nothing.
  *
  * Thread model:
- *   NimBLE host task: GAP events, GATT writes -> decode -> RX ring
+ *   NimBLE host task: GAP events, GATT writes -> decode -> RX ring (timed,
+ *                  midi_timed_ring.h: released at the times the central's
+ *                  timestamps give)
  *   any task       : BLE_MIDI_DEVICE_send_packet -> TX ring (never blocks)
  *   ble_midi_dev task (same core as the NimBLE host): batches the TX ring
  *                  into notifications, runs enable / disable
@@ -67,16 +69,21 @@ int BLE_MIDI_DEVICE_send_packet(uint8_t cable, uint8_t cin,
 int BLE_MIDI_DEVICE_bytes_available(void);
 int BLE_MIDI_DEVICE_read_packet(uint8_t *buf, size_t maxlen);
 
+/* Receive timing correction: -1 automatic (connection interval + margin),
+ * 0 off, otherwise microseconds (at most 100 ms). Takes effect at once. */
+void    BLE_MIDI_DEVICE_set_rx_latency(int32_t us);
+int32_t BLE_MIDI_DEVICE_rx_latency_setting(void);
+
 /* Drop the current link (advertising resumes while enabled) */
 void BLE_MIDI_DEVICE_disconnect(void);
 
 typedef enum {
     BLE_MIDI_DEVICE_OFF = 0,       /* not enabled */
-    BLE_MIDI_DEVICE_STARTING,      /* BLE host starting */
+    BLE_MIDI_DEVICE_STARTING,      /* BLE host starting, or advertising paused for the BLE class */
     BLE_MIDI_DEVICE_ADVERTISING,
     BLE_MIDI_DEVICE_LINKED,        /* connected, not subscribed yet */
     BLE_MIDI_DEVICE_CONNECTED,     /* subscribed: MIDI flows */
-    BLE_MIDI_DEVICE_ERROR,         /* the host did not start (or is held by the BLE class) */
+    BLE_MIDI_DEVICE_ERROR,         /* the host did not start */
 } ble_midi_device_state_t;
 
 typedef struct {
@@ -91,6 +98,8 @@ typedef struct {
     uint32_t rx_messages;          /* USB-MIDI packets decoded */
     uint32_t rx_dropped;           /* RX ring full */
     uint32_t decode_errors;
+    uint32_t rx_late;              /* later than the latency allows: passed on at once */
+    int32_t  rx_latency_us;        /* correction in use (0: off) */
     uint32_t tx_messages;          /* USB-MIDI packets queued */
     uint32_t tx_packets;           /* notifications sent */
     uint32_t tx_dropped;           /* not connected / queue full */
